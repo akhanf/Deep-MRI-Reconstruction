@@ -16,11 +16,11 @@ from scipy.io import loadmat
 from utils import compressed_sensing as cs
 from utils.metric import complex_psnr
 
-from cascadenet.network.model import build_d2_c2, build_d5_c5
+from cascadenet.network.model import build_d2_c2_s, build_d5_c10_s
 from cascadenet.util.helpers import from_lasagne_format
 from cascadenet.util.helpers import to_lasagne_format
 
-
+#LOADING DATA
 def prep_input(im, acc=4):
     """Undersample the batch, then reformat them into what the network accepts.
 
@@ -48,25 +48,34 @@ def iterate_minibatch(data, batch_size, shuffle=True):
     for i in xrange(0, n, batch_size):
         yield data[i:i+batch_size]
 
-
+#DEFINING HYPERPARAMETERS
 def create_dummy_data():
-    """
-    Creates dummy dataset from one knee subject for demo.
-    In practice, one should take much bigger dataset,
-    as well as train & test should have similar distribution.
+    """Create small lungs data based on patches for demo.
 
-    Source: http://mridata.org/
-    """
-    data = loadmat(join(project_root, './data/lustig_knee_p2.mat'))['xn']
-    nx, ny, nz, nc = data.shape
+    Note that in practice, at test time the method will need to be applied to
+    the whole volume. In addition, one would need more data to prevent
+    overfitting.
 
-    train = np.transpose(data, (3, 0, 1, 2)).reshape((-1, ny, nz))
-    validate = np.transpose(data, (3, 1, 0, 2)).reshape((-1, nx, nz))
-    test = np.transpose(data, (3, 2, 0, 1)).reshape((-1, nx, ny))
+    """
+    data = loadmat(join(project_root, './data/lungs.mat'))['seq']
+    nx, ny, nt = data.shape
+    ny_red = 8
+    sl = ny//ny_red
+    data_t = np.transpose(data, (2, 0, 1))
+
+    data_t[:, :, :sl*4]
+    train_slice = data_t[:, :, :sl*4]
+    validate_slice = data_t[:, :, ny//2:ny//2+ny//4]
+    test_slice = data_t[:, :, ny//2+ny//4]
+
+    # Synthesize data by extracting patches
+    train = np.array([data_t[..., i:i+sl] for i in np.random.randint(0, sl*3, 20)])
+    validate = np.array([data_t[..., i:i+sl] for i in (sl*4, sl*5)])
+    test = np.array([data_t[..., i:i+sl] for i in (sl*6, sl*7)])
 
     return train, validate, test
 
-
+#PREPROCESSING
 def compile_fn(network, net_config, args):
     """
     Create Training function and validation function
@@ -79,7 +88,7 @@ def compile_fn(network, net_config, args):
     input_var = net_config['input'].input_var
     mask_var = net_config['mask'].input_var
     kspace_var = net_config['kspace_input'].input_var
-    target_var = T.tensor4('targets')
+    target_var = T.tensor5('targets')
 
     # Objective
     pred = lasagne.layers.get_output(network)
@@ -107,12 +116,14 @@ def compile_fn(network, net_config, args):
 
     return train_fn, val_fn
 
-
+#DEFINING NETWORK
+#Fragments were attributed from https://github.com/js3611/Deep-MRI-Reconstruction
+#Activation function =  ReLU
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_epoch', metavar='int', nargs=1, default=['10'],
                         help='number of epochs')
-    parser.add_argument('--batch_size', metavar='int', nargs=1, default=['10'],
+    parser.add_argument('--batch_size', metavar='int', nargs=1, default=['1'],
                         help='batch size')
     parser.add_argument('--lr', metavar='float', nargs=1,
                         default=['0.001'], help='initial learning rate')
@@ -121,10 +132,6 @@ if __name__ == '__main__':
     parser.add_argument('--acceleration_factor', metavar='float', nargs=1,
                         default=['4.0'],
                         help='Acceleration factor for k-space sampling')
-    # parser.add_argument('--gauss_ivar', metavar='float', nargs=1,
-    #                     default=['0.0015'],
-    #                     help='Sensitivity for Gaussian Distribution which'
-    #                     'decides the undersampling rate of the Cartesian mask')
     parser.add_argument('--debug', action='store_true', help='debug mode')
     parser.add_argument('--savefig', action='store_true',
                         help='Save output images and masks')
@@ -132,12 +139,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Project config
-    model_name = 'd2_c2'
-    #gauss_ivar = float(args.gauss_ivar[0])  # undersampling rate
+    model_name = 'd5_c10_s'
     acc = float(args.acceleration_factor[0])  # undersampling rate
     num_epoch = int(args.num_epoch[0])
     batch_size = int(args.batch_size[0])
-    Nx, Ny = 128, 128
+    Nx, Ny, Nt = 256, 256, 30
+    Ny_red = 8
     save_fig = args.savefig
     save_every = 5
 
@@ -147,37 +154,34 @@ if __name__ == '__main__':
     if not os.path.isdir(save_dir):
         os.makedirs(save_dir)
 
-    # Specify network
-    input_shape = (batch_size, 2, Nx, Ny)
-    net_config, net,  = build_d2_c2(input_shape)
-
-    # # Load D5-C5 with pretrained params
-    # net_config, net,  = build_d5_c5(input_shape)
-    # D5-C5 with pre-trained parameters
-    # with np.load('./models/pretrained/d5_c5.npz') as f:
-    #     param_values = [f['arr_{0}'.format(i)] for i in range(len(f.files))]
-    #     lasagne.layers.set_all_param_values(net, param_values)
-
-    # Compute acceleration rate
-    dummy_mask = cs.cartesian_mask((10, Nx, Ny), acc, sample_n=8)
-    sample_und_factor = cs.undersampling_rate(dummy_mask)
-    print('Undersampling Rate: {:.2f}'.format(sample_und_factor))
-
-    # Compile function
-    train_fn, val_fn = compile_fn(net, net_config, args)
-
-
     # Create dataset
     train, validate, test = create_dummy_data()
 
-    print('Start Training...')
+    # Test creating mask and compute the acceleration rate
+    dummy_mask = cs.cartesian_mask((10, Nx, Ny//Ny_red), acc, sample_n=8)
+    sample_und_factor = cs.undersampling_rate(dummy_mask)
+    print('Undersampling Rate: {:.2f}'.format(sample_und_factor))
+
+    # Specify network, preprocessing data
+    input_shape = (batch_size, 2, Nx, Ny//Ny_red, Nt)
+    net_config, net,  = build_d2_c2_s(input_shape)
+
+    # # build D5-C10(S) with pre-trained parameters
+    # net_config, net,  = build_d5_c10_s(input_shape)
+    # with np.load('./models/pretrained/d5_c10_s.npz') as f:
+    #     param_values = [f['arr_{0}'.format(i)] for i in range(len(f.files))]
+    #     lasagne.layers.set_all_param_values(net, param_values)
+
+    # Compile function
+    train_fn, val_fn = compile_fn(net, net_config, args)
+#TRAINING
     for epoch in xrange(num_epoch):
         t_start = time.time()
         # Training
         train_err = 0
         train_batches = 0
         for im in iterate_minibatch(train, batch_size, shuffle=True):
-            im_und, k_und, mask, im_gnd = prep_input(im, acc=acc)
+            im_und, k_und, mask, im_gnd = prep_input(im, acc)
             err = train_fn(im_und, mask, k_und, im_gnd)[0]
             train_err += err
             train_batches += 1
@@ -188,7 +192,7 @@ if __name__ == '__main__':
         validate_err = 0
         validate_batches = 0
         for im in iterate_minibatch(validate, batch_size, shuffle=False):
-            im_und, k_und, mask, im_gnd = prep_input(im, acc=acc)
+            im_und, k_und, mask, im_gnd = prep_input(im, acc)
             err, pred = val_fn(im_und, mask, k_und, im_gnd)
             validate_err += err
             validate_batches += 1
@@ -202,8 +206,7 @@ if __name__ == '__main__':
         test_psnr = 0
         test_batches = 0
         for im in iterate_minibatch(test, batch_size, shuffle=False):
-            im_und, k_und, mask, im_gnd = prep_input(im, acc=acc)
-
+            im_und, k_und, mask, im_gnd = prep_input(im, acc)
             err, pred = val_fn(im_und, mask, k_und, im_gnd)
             test_err += err
             for im_i, und_i, pred_i in zip(im,
@@ -211,7 +214,6 @@ if __name__ == '__main__':
                                            from_lasagne_format(pred)):
                 base_psnr += complex_psnr(im_i, und_i, peak='max')
                 test_psnr += complex_psnr(im_i, pred_i, peak='max')
-            test_batches += 1
 
             if save_fig and test_batches % save_every == 0:
                 vis.append((im[0],
@@ -219,6 +221,7 @@ if __name__ == '__main__':
                             from_lasagne_format(im_und)[0],
                             from_lasagne_format(mask, mask=True)[0]))
 
+            test_batches += 1
             if args.debug and test_batches == 20:
                 break
 
@@ -229,7 +232,7 @@ if __name__ == '__main__':
         test_err /= test_batches
         base_psnr /= (test_batches*batch_size)
         test_psnr /= (test_batches*batch_size)
-
+#INFERENCE
         # Then we print the results for this epoch:
         print("Epoch {}/{}".format(epoch+1, num_epoch))
         print(" time: {}s".format(t_end - t_start))
@@ -238,18 +241,20 @@ if __name__ == '__main__':
         print(" test loss:\t\t{:.6f}".format(test_err))
         print(" base PSNR:\t\t{:.6f}".format(base_psnr))
         print(" test PSNR:\t\t{:.6f}".format(test_psnr))
-
+#OUTPUT
         # save the model
         if epoch in [1, 2, num_epoch-1]:
             if save_fig:
                 i = 0
                 for im_i, pred_i, und_i, mask_i in vis:
-                    plt.imsave(join(save_dir, 'im{0}.png'.format(i)),
-                               abs(np.concatenate([und_i, pred_i,
-                                                   im_i, im_i - pred_i], 1)),
-                               cmap='gray')
-                    plt.imsave(join(save_dir, 'mask{0}.png'.format(i)), mask_i,
-                               cmap='gray')
+                    im = abs(np.concatenate([und_i[0], pred_i[0], im_i[0], im_i[0] - pred_i[0]], 1))
+                    plt.imsave(join(save_dir, 'im{0}_x.png'.format(i)), im, cmap='gray')
+
+                    im = abs(np.concatenate([und_i[..., 0], pred_i[..., 0],
+                                             im_i[..., 0], im_i[..., 0] - pred_i[..., 0]], 0))
+                    plt.imsave(join(save_dir, 'im{0}_t.png'.format(i)), im, cmap='gray')
+                    plt.imsave(join(save_dir, 'mask{0}.png'.format(i)),
+                               np.fft.fftshift(mask_i[..., 0]), cmap='gray')
                     i += 1
 
             name = '%s_epoch_%d.npz' % (model_name, epoch)
